@@ -31,6 +31,7 @@ interface IToken0Token1AmmQuote {
 /// - 二级市场：托管式（上架把NFT转入本合约，不定价）；买价按“铸造原价”为基数实时线性每月+4%（不复利、实时增长）
 /// - 二级市场手续费：买家额外支付，可选用USDT或代币B；B数量用你给的SwapHrxUsdt报价公式换算（token1=USDT, token0=B）
 /// - 增加：维护“正在上架 tokenId 动态数组”，便于前端获取正在上架的盲盒
+/// - 增加：分页枚举 owner NFTs；分页读取 minted/openAction 并返回 BoxInfo
 contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -103,7 +104,7 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
     // -------------------- Slots purchased with A --------------------
     mapping(address => uint256) public extraSlots; // 额外槽位（每天额外open次数）
 
-    uint256 public globalSlotStepCost;                  // 全局步长a（管理员可改）
+    uint256 public globalSlotStepCost;                   // 全局步长a（管理员可改）
     mapping(address => uint256) public userSlotStepCost; // 用户个人步长a（首次购买锁定，管理员改不影响）
 
     // -------------------- Escrow Marketplace (no manual pricing) --------------------
@@ -198,8 +199,8 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
         tierPrice[2] = 50 * DECIMALS_18;
         tierPrice[3] = 100 * DECIMALS_18;
 
-        // 默认手续费为0
-        feeRate = 10;
+        // 默认手续费（你代码里写了非0）
+        feeRate = 100;
         feeBase = BPS_DENOMINATOR;
 
         feeRateTwo = 50;
@@ -273,7 +274,7 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
         emit GlobalSlotStepCostChanged(old, newCost);
     }
 
-    /// @notice 可选：若你要调整“铸造原价”，管理员可改（已铸造NFT不受影响，它们的基数已写死在 boxInfo.usdtPaid）
+    /// @notice 可选：调整“铸造原价”，仅影响未来新铸造；已铸造NFT不受影响（boxInfo.usdtPaid已写死）
     function setTierPrice(uint8 tier, uint256 newPrice) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(tier >= 1 && tier <= 3, "tier 1..3");
         require(newPrice > 0, "price=0");
@@ -649,12 +650,42 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
     //                         Views / Helpers
     // ============================================================
 
-    /// @notice 枚举用户持有的tokenId（注意：托管上架后 owner=本合约，钱包里看不到；请用 listedTokenIds 获取上架列表）
+    /// @notice （保留）一次性枚举 owner 持有的 tokenId（不分页，适合小数量）
     function tokensOfOwner(address owner) external view returns (uint256[] memory ids) {
         uint256 bal = balanceOf(owner);
         ids = new uint256[](bal);
         for (uint256 i = 0; i < bal; i++) {
             ids[i] = tokenOfOwnerByIndex(owner, i);
+        }
+    }
+
+    /// @notice ✅新增：分页枚举 owner 持有的 tokenId，并返回对应 BoxInfo
+    /// @param owner 查询地址
+    /// @param start 从 owner 的 index=start 开始（0-based）
+    /// @param count 最多返回多少条
+    /// @return tokenIds tokenId数组
+    /// @return infos   与 tokenIds 一一对应的 BoxInfo 数组
+    function getOwnerTokensByPage(address owner, uint256 start, uint256 count)
+        external
+        view
+        returns (uint256[] memory tokenIds, BoxInfo[] memory infos)
+    {
+        uint256 bal = balanceOf(owner);
+        if (start >= bal) {
+            return (new uint256[](0), new BoxInfo[](0));
+        }
+
+        uint256 end = start + count;
+        if (end > bal) end = bal;
+
+        uint256 n = end - start;
+        tokenIds = new uint256[](n);
+        infos = new BoxInfo[](n);
+
+        for (uint256 i = 0; i < n; i++) {
+            uint256 tokenId = tokenOfOwnerByIndex(owner, start + i);
+            tokenIds[i] = tokenId;
+            infos[i] = boxInfo[tokenId];
         }
     }
 
@@ -664,6 +695,56 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
 
     function openActionTokenIdsLength() external view returns (uint256) {
         return openActionTokenIds.length;
+    }
+
+    /// @notice ✅新增：分页读取 mintedTokenIds，并返回每个NFT的 BoxInfo
+    function getMintedByPage(uint256 start, uint256 count)
+        external
+        view
+        returns (uint256[] memory tokenIds, BoxInfo[] memory infos)
+    {
+        uint256 len = mintedTokenIds.length;
+        if (start >= len) {
+            return (new uint256[](0), new BoxInfo[](0));
+        }
+
+        uint256 end = start + count;
+        if (end > len) end = len;
+
+        uint256 n = end - start;
+        tokenIds = new uint256[](n);
+        infos = new BoxInfo[](n);
+
+        for (uint256 i = 0; i < n; i++) {
+            uint256 tokenId = mintedTokenIds[start + i];
+            tokenIds[i] = tokenId;
+            infos[i] = boxInfo[tokenId];
+        }
+    }
+
+    /// @notice ✅新增：分页读取 openActionTokenIds，并返回每个NFT的 BoxInfo
+    function getOpenedByPage(uint256 start, uint256 count)
+        external
+        view
+        returns (uint256[] memory tokenIds, BoxInfo[] memory infos)
+    {
+        uint256 len = openActionTokenIds.length;
+        if (start >= len) {
+            return (new uint256[](0), new BoxInfo[](0));
+        }
+
+        uint256 end = start + count;
+        if (end > len) end = len;
+
+        uint256 n = end - start;
+        tokenIds = new uint256[](n);
+        infos = new BoxInfo[](n);
+
+        for (uint256 i = 0; i < n; i++) {
+            uint256 tokenId = openActionTokenIds[start + i];
+            tokenIds[i] = tokenId;
+            infos[i] = boxInfo[tokenId];
+        }
     }
 
     /// @notice 当前窗口open额度（12:00~次日12:00）
