@@ -24,6 +24,9 @@ interface IBlindBoxValue {
 /// - 顶级分红条件：
 ///   1) topEnabled[top]==true（管理员开关）
 ///   2) stakedA[top] >= minStakeA
+///
+/// @dev 本版本：注册时不检查伞顶是否达到 minStakeA；
+///      在 setReward 分配时才检查 top 是否合格，不合格则 top 不拿对应 top 份额（该份额归项目方）。
 contract UmbrellaStakeDividend is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -57,7 +60,11 @@ contract UmbrellaStakeDividend is AccessControl, ReentrancyGuard {
         return _childrenOf[u].length;
     }
 
-    function getChildrenByPage(address u, uint256 start, uint256 count) external view returns (address[] memory out) {
+    function getChildrenByPage(
+        address u,
+        uint256 start,
+        uint256 count
+    ) external view returns (address[] memory out) {
         uint256 len = _childrenOf[u].length;
         if (start >= len) return new address[](0);
         uint256 end = start + count;
@@ -189,7 +196,10 @@ contract UmbrellaStakeDividend is AccessControl, ReentrancyGuard {
         emit ConfigRefProfit(bps);
     }
 
-    function setHoldValueConfig(uint256 minV, uint256 maxV, uint256 minPortionBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setHoldValueConfig(uint256 minV, uint256 maxV, uint256 minPortionBps)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
         require(maxV > 0 && maxV >= minV, "BAD_RANGE");
         require(minPortionBps <= bpsDenominator, "BAD_MIN_PORTION");
         holdValueMin = minV;
@@ -208,7 +218,7 @@ contract UmbrellaStakeDividend is AccessControl, ReentrancyGuard {
     // -------------------- register --------------------
 
     /// @notice 注册：parent 为上级地址；若 parent==0 则自己成为顶级（伞顶）
-    /// @dev 若要注册到某上级下：必须满足「该伞顶 top 已质押 >= minStakeA」
+    /// @dev 本版本：注册不再检查伞顶是否达到 minStakeA；顶级分红资格在 setReward 时判断
     function register(address parent) external {
         address user = msg.sender;
         require(!registered[user], "ALREADY_REGISTERED");
@@ -231,8 +241,8 @@ contract UmbrellaStakeDividend is AccessControl, ReentrancyGuard {
         address top = topOf[parent];
         require(top != address(0), "BAD_TOP");
 
-        // 允许挂靠到该伞顶的条件：伞顶质押达到最低值
-        require(stakedA[top] >= minStakeA, "TOP_STAKE_TOO_LOW");
+        // ✅ 取消注册时的质押门槛检查：
+        // require(stakedA[top] >= minStakeA, "TOP_STAKE_TOO_LOW");
 
         registered[user] = true;
         parentOf[user] = parent;
@@ -359,6 +369,7 @@ contract UmbrellaStakeDividend is AccessControl, ReentrancyGuard {
         uint256 toProject = 0;
 
         if (rest > 0) {
+            // ✅ 分红时检查 top 是否合格：不合格则 top 不拿 top 份额
             if (isTopEligible(top)) {
                 toTop = rest / 2;
                 toProject = rest - toTop;
@@ -370,7 +381,20 @@ contract UmbrellaStakeDividend is AccessControl, ReentrancyGuard {
             }
         }
 
-        emit RewardNotified(user, profit, userShare, l1, l2, top, pool, uplinePortionBps, toL1, toL2, toTop, toProject);
+        emit RewardNotified(
+            user,
+            profit,
+            userShare,
+            l1,
+            l2,
+            top,
+            pool,
+            uplinePortionBps,
+            toL1,
+            toL2,
+            toTop,
+            toProject
+        );
     }
 
     function _addPending(address u, uint256 amt) internal {
@@ -392,5 +416,52 @@ contract UmbrellaStakeDividend is AccessControl, ReentrancyGuard {
         if (bps > bpsDenominator) bps = bpsDenominator;
         if (bps < minUplinePortionBps) bps = minUplinePortionBps;
         return bps;
+    }
+
+    // -------------------- profile (avatar & nickname) --------------------
+    struct Profile {
+        string nickname; // 昵称
+        string avatar;   // 头像（可存 URL / IPFS CID 等）
+    }
+
+    /// @notice 地址 -> 资料（公开可读）
+    mapping(address => Profile) public profileOf;
+
+    /// @dev 防止有人用超长字符串恶意占用存储/导致前端卡顿（可按需调整或删除）
+    uint256 public constant MAX_NICKNAME_LEN = 32;   // 32 bytes
+    uint256 public constant MAX_AVATAR_LEN   = 256;  // 256 bytes
+
+    event ProfileUpdated(address indexed user, string nickname, string avatar);
+
+    /// @notice 一次性设置昵称+头像（传空字符串可视为清空）
+    function setProfile(string calldata nickname, string calldata avatar) external {
+        require(bytes(nickname).length <= MAX_NICKNAME_LEN, "NICK_TOO_LONG");
+        require(bytes(avatar).length <= MAX_AVATAR_LEN, "AVATAR_TOO_LONG");
+
+        profileOf[msg.sender] = Profile({nickname: nickname, avatar: avatar});
+        emit ProfileUpdated(msg.sender, nickname, avatar);
+    }
+
+    /// @notice 只改昵称
+    function setNickname(string calldata nickname) external {
+        require(bytes(nickname).length <= MAX_NICKNAME_LEN, "NICK_TOO_LONG");
+        profileOf[msg.sender].nickname = nickname;
+        emit ProfileUpdated(msg.sender, profileOf[msg.sender].nickname, profileOf[msg.sender].avatar);
+    }
+
+    /// @notice 只改头像
+    function setAvatar(string calldata avatar) external {
+        require(bytes(avatar).length <= MAX_AVATAR_LEN, "AVATAR_TOO_LONG");
+        profileOf[msg.sender].avatar = avatar;
+        emit ProfileUpdated(msg.sender, profileOf[msg.sender].nickname, profileOf[msg.sender].avatar);
+    }
+
+    function withdrawERC20(address token, address to, uint256 amount)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        nonReentrant
+    {
+        require(to != address(0), "to=0");
+        IERC20(token).safeTransfer(to, amount);
     }
 }

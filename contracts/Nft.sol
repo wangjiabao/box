@@ -3,7 +3,6 @@ pragma solidity ^0.8.26;
 
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -31,7 +30,8 @@ interface IUmbrellaStakeDividend {
     function setReward(address user, uint256 profit) external;
 }
 
-/// @title BlindBox NFT + Escrow Marketplace + HoldingValue (BSC 18 decimals)
+/// @title BlindBox NFT + Escrow Marketplace + HoldingValue
+/// @notice HoldingValue = 未开盒盲盒价值(仅铸造价聚合) + Piece burn 追加价值(按管理员设定 Piece 单价累计)
 contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -46,13 +46,13 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
     uint256 public constant DAY_SHIFT_SECONDS = 12 hours;
     uint256 public constant BASE_DAILY_OPENS = 1;
 
-    // -------------------- Adjustable Params (DEFAULT_ADMIN_ROLE can change) --------------------
+    // -------------------- Adjustable Params --------------------
     uint256 public bpsDenominator = 10_000;
 
     /// @notice mint 分账：给 AccountA 的 bps（默认 9800 = 98%）
     uint256 public accountAFeeBps = 9_800;
 
-    /// @notice 新铸造 token 使用的默认线性月增长率（18位，例：0.04e18）
+    /// @notice 二级市场线性增长：新铸造 token 使用的默认线性月增长率（18位）
     uint256 public monthlyRateDefaultE18 = 4e16; // 0.04e18
 
     // -------------------- OpenBox extra BNB fee --------------------
@@ -71,26 +71,41 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
     IToken0Token1AmmQuote public feeQuotePool;
     IERC20 public feeTokenB; // = feeQuotePool.token0()
 
+    // -------------------- Piece integration --------------------
+    /// @notice Piece 合约地址（只有它能调用 holdingAdd）
+    address public pieceToken;
+
+    /// @notice 1 Piece(1e18) 价值多少 USDT（18位）
+    uint256 public pieceValueUsdtE18;
+
+    /// @dev Piece burn 追加的持有价值累计（USDT 18位）
+    mapping(address => uint256) private _pieceHoldingValue;
+
     // -------------------- Mint tier prices (fixed original mint price) --------------------
     mapping(uint8 => uint256) public tierPrice; // 1=>20,2=>50,3=>100 (18 decimals)
 
     // -------------------- NFT Data --------------------
     struct BoxInfo {
         uint8 tier;
-        uint256 usdtPaid;     // 铸造原价（固定档位价），也是二级市场涨价基数
-        uint64 mintedAt;
+        uint256 usdtPaid;     // 铸造原价（固定档位价）
+        uint64 mintedAt;      // 仅用于二级市场线性增长价格计算
         uint64 openedAt;      // open时间（不可逆）
         int256 reward;
         uint64 rewardSetAt;   // 0=未设置；设置后不可再改
+
+        uint256 tokenId;      // ✅ NEW: 在 BoxInfo 里带 tokenId（建议放末尾，兼容升级布局）
     }
     mapping(uint256 => BoxInfo) public boxInfo;
 
     /// @notice open 为 public，且不可逆
     mapping(uint256 => bool) public open;
 
-    // -------------------- Arrays log --------------------
-    uint256[] public mintedTokenIds;      // 所有铸造tokenId
-    uint256[] public openActionTokenIds;  // 所有open动作tokenId
+    /// @notice 每个 token 在 mint 时快照自己的增长率（用于二级市场价格，不用于 holdingValue）
+    mapping(uint256 => uint256) public tokenMonthlyRateE18;
+
+    // -------------------- Arrays log (global) --------------------
+    uint256[] public mintedTokenIds;       // 所有铸造tokenId（日志用，不做删除）
+    uint256[] public openActionTokenIds;   // ✅ NEW: 全局开盲盒记录 tokenId（append-only）
 
     // -------------------- TokenId Counter --------------------
     uint256 private _nextTokenId = 1;
@@ -126,24 +141,22 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
     uint256 public feeRateTwo;  // B fee: feeU = price * feeRateTwo / feeBaseTwo; feeB = quoteFeeInB(feeU)
     uint256 public feeBaseTwo;
 
-    // -------------------- Holding Value (economic owner) --------------------
-    /// @notice 经济持有者：用于“持有价值统计”
-    /// - 上架/下架不改变
-    /// - 成交购买时才切换到买家
-    /// - open 后移除（置 0）
-    mapping(uint256 => address) public economicHolder;
+    // -------------------- Holding Value (simplified) --------------------
+    /// @dev 聚合：Σ base（仅未开盒盲盒的 usdtPaid 之和）
+    mapping(address => uint256) private _sumUnopenedBase;
 
-    /// @notice 每个 token 在 mint 时快照自己的增长率（避免你后续改默认 rate 导致历史估值失真）
-    mapping(uint256 => uint256) public tokenMonthlyRateE18;
+    // -------------------- User Lists: My Unopened & My Opened --------------------
+    /// @notice 我当前“未开盒盲盒列表”（托管中也仍在卖家列表里）
+    mapping(address => uint256[]) private _myUnopenedBoxes;
+    mapping(address => mapping(uint256 => uint256)) private _myUnopenedPosPlusOne; // user => tokenId => idx+1
 
-    /// @dev 聚合：Σ base
-    mapping(address => uint256) private _sumBase;
+    /// @notice 我的“已打开盲盒列表”
+    mapping(address => uint256[]) private _myOpenedBoxes;
+    mapping(address => mapping(uint256 => uint256)) private _myOpenedPosPlusOne; // user => tokenId => idx+1
 
-    /// @dev 聚合：Σ (base * rateE18)
-    mapping(address => uint256) private _sumBR;
-
-    /// @dev 聚合：Σ (base * rateE18 * mintedAt)
-    mapping(address => uint256) private _sumBRMinted;
+    // -------------------- Seller sold list (after purchase) --------------------
+    /// @notice 卖家的成交 tokenId 列表（仅记录成交，不删除）
+    mapping(address => uint256[]) private _sellerSoldTokenIds;
 
     // -------------------- Events --------------------
     event ParamsChanged(uint256 bpsDenominator, uint256 accountAFeeBps, uint256 monthlyRateDefaultE18);
@@ -164,13 +177,7 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
 
     event RewardSetOnce(address indexed admin, uint256 indexed tokenId, int256 reward, uint256 timestamp, uint256 profitNotified);
 
-    event SlotsPurchased(
-        address indexed buyer,
-        uint256 count,
-        uint256 stepCostLocked,
-        uint256 totalCost,
-        uint256 newExtraSlots
-    );
+    event SlotsPurchased(address indexed buyer, uint256 count, uint256 stepCostLocked, uint256 totalCost, uint256 newExtraSlots);
 
     event Listed(address indexed seller, uint256 indexed tokenId, uint256 timestamp);
     event Unlisted(address indexed operator, uint256 indexed tokenId);
@@ -189,6 +196,13 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
     event FeeConfigBChanged(uint256 rateTwo, uint256 baseTwo);
 
     event ERC20Withdrawn(address indexed token, address indexed to, uint256 amount);
+
+    event Burned(address indexed owner, uint256 indexed tokenId, uint256 timestamp);
+
+    event PieceTokenChanged(address indexed oldPiece, address indexed newPiece);
+    event PieceValueChanged(uint256 oldValueUsdtE18, uint256 newValueUsdtE18);
+
+    event PieceHoldingAdded(address indexed user, uint256 burnAmount, uint256 valueAddedUsdt, uint256 newPieceHoldingValue);
 
     constructor(
         string memory name_,
@@ -228,7 +242,10 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
     //                    Admin setters
     // ============================================================
 
-    function setParams(uint256 denom, uint256 aFeeBps, uint256 monthlyRateDefault) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setParams(uint256 denom, uint256 aFeeBps, uint256 monthlyRateDefault)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
         require(denom > 0, "DENOM=0");
         require(aFeeBps <= denom, "A_FEE_TOO_BIG");
         bpsDenominator = denom;
@@ -316,6 +333,33 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
         emit FeeQuotePoolChanged(pool, b);
     }
 
+    // ---- Piece config ----
+
+    function setPieceToken(address newPiece) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        address old = pieceToken;
+        pieceToken = newPiece;
+        emit PieceTokenChanged(old, newPiece);
+    }
+
+    function setPieceValueUsdtE18(uint256 newValueUsdtE18) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        uint256 old = pieceValueUsdtE18;
+        pieceValueUsdtE18 = newValueUsdtE18;
+        emit PieceValueChanged(old, newValueUsdtE18);
+    }
+
+    /// @notice Piece burn 回调：只有 pieceToken 能调用
+    function holdingAdd(address user, uint256 burnAmount) external {
+        require(msg.sender == pieceToken, "ONLY_PIECE");
+        require(user != address(0), "USER_0");
+        require(burnAmount > 0, "BURN_0");
+        require(pieceValueUsdtE18 > 0, "PIECE_PRICE_0");
+
+        uint256 valueAdded = Math.mulDiv(burnAmount, pieceValueUsdtE18, DECIMALS_18);
+        _pieceHoldingValue[user] += valueAdded;
+
+        emit PieceHoldingAdded(user, burnAmount, valueAdded, _pieceHoldingValue[user]);
+    }
+
     // ============================================================
     //                           Minting
     // ============================================================
@@ -339,27 +383,6 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
         }
     }
 
-    function mintBatchWithTiers(uint8[] calldata tiers) external nonReentrant returns (uint256[] memory tokenIds) {
-        uint256 n = tiers.length;
-        require(n > 0, "tiers empty");
-
-        uint256 total = 0;
-        uint256[] memory prices = new uint256[](n);
-
-        for (uint256 i = 0; i < n; i++) {
-            uint256 p = _requireTierPrice(tiers[i]);
-            prices[i] = p;
-            total += p;
-        }
-
-        _collectUsdtMint(msg.sender, total);
-
-        tokenIds = new uint256[](n);
-        for (uint256 i = 0; i < n; i++) {
-            tokenIds[i] = _mintInternal(msg.sender, tiers[i], prices[i]);
-        }
-    }
-
     function _requireTierPrice(uint8 tier) internal view returns (uint256 p) {
         require(tier >= 1 && tier <= 3, "tier 1..3");
         p = tierPrice[tier];
@@ -369,11 +392,12 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
     function _mintInternal(address to, uint8 tier, uint256 paid) internal returns (uint256 tokenId) {
         tokenId = _nextTokenId++;
 
-        // 先写入 BoxInfo 与 tokenRate（保证 _update 钩子里可读）
         BoxInfo storage b = boxInfo[tokenId];
         b.tier = tier;
         b.usdtPaid = paid;
         b.mintedAt = uint64(block.timestamp);
+
+        b.tokenId = tokenId; // ✅ NEW
 
         tokenMonthlyRateE18[tokenId] = monthlyRateDefaultE18;
 
@@ -384,7 +408,7 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
         emit Minted(to, tokenId, tier, paid);
     }
 
-    /// @dev mint收款：toA 给 AccountA；其余直接给 stakingContract（不留在 NFT 合约）
+    /// @dev mint收款：toA 给 AccountA；其余直接给 stakingContract
     function _collectUsdtMint(address payer, uint256 total) internal {
         require(accountA != address(0), "AccountA not set");
         require(address(stakingContract) != address(0), "staking not set");
@@ -419,21 +443,17 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
         // 2) 消耗 open 次数
         _consumeOpenAllowance(msg.sender);
 
-        // 3) open 后从“持有价值统计”移除（不可逆）
-        address holder = economicHolder[tokenId];
-        require(holder == msg.sender, "bad holder");
-
+        // 3) holding & 列表：未开盒 -> 已打开
         uint256 base = boxInfo[tokenId].usdtPaid;
-        uint256 rate = tokenMonthlyRateE18[tokenId];
-        uint256 mAt = uint256(boxInfo[tokenId].mintedAt);
 
-        _holdingRemove(holder, base, rate, mAt);
-        economicHolder[tokenId] = address(0);
+        _holdingRemoveBox(msg.sender, base);
+        _myUnopenedRemove(msg.sender, tokenId);
+        _myOpenedAdd(msg.sender, tokenId);
 
         open[tokenId] = true;
         boxInfo[tokenId].openedAt = uint64(block.timestamp);
 
-        openActionTokenIds.push(tokenId);
+        openActionTokenIds.push(tokenId); // ✅ NEW: 全局开盲盒记录（append-only）
 
         emit Opened(msg.sender, tokenId, block.timestamp, msg.value);
     }
@@ -475,12 +495,41 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
             if (uint256(reward_) > paid) {
                 profitNotified = uint256(reward_) - paid;
                 require(address(stakingContract) != address(0), "staking not set");
-                address holder = ownerOf(tokenId); // open 后不可交易，owner稳定
+                address holder = ownerOf(tokenId);
                 stakingContract.setReward(holder, profitNotified);
             }
         }
 
         emit RewardSetOnce(msg.sender, tokenId, reward_, block.timestamp, profitNotified);
+    }
+
+    // ============================================================
+    //                  Burn (only after open + reward set)
+    // ============================================================
+
+    function burnAfterReward(uint256 tokenId) external nonReentrant {
+        require(_ownerOf(tokenId) != address(0), "nonexistent token");
+        require(ownerOf(tokenId) == msg.sender, "only owner");
+        require(open[tokenId] == true, "must be opened");
+        require(boxInfo[tokenId].rewardSetAt != 0, "reward not set");
+
+        _burn(tokenId);
+
+        emit Burned(msg.sender, tokenId, block.timestamp);
+    }
+
+    function burnAfterRewardBatch(uint256[] calldata tokenIds) external nonReentrant {
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            uint256 tokenId = tokenIds[i];
+
+            require(_ownerOf(tokenId) != address(0), "nonexistent token");
+            require(ownerOf(tokenId) == msg.sender, "only owner");
+            require(open[tokenId] == true, "must be opened");
+            require(boxInfo[tokenId].rewardSetAt != 0, "reward not set");
+
+            _burn(tokenId);
+            emit Burned(msg.sender, tokenId, block.timestamp);
+        }
     }
 
     // ============================================================
@@ -511,7 +560,7 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
     }
 
     // ============================================================
-    //                 Secondary Market Dynamic Price (linear, realtime)
+    //                 Secondary Market Price (linear growth kept)
     // ============================================================
 
     function secondaryBuyPrice(uint256 tokenId) public view returns (uint256 price) {
@@ -527,7 +576,6 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
             elapsed = block.timestamp - uint256(b.mintedAt);
         }
 
-        // increment = base * rate * elapsed / (1e18 * 30days)
         uint256 numerator = rate * elapsed;
         uint256 inc = Math.mulDiv(base, numerator, DECIMALS_18 * MONTH_SECONDS);
 
@@ -542,16 +590,26 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
         return listedTokenIds.length;
     }
 
-    function getListedTokenIds(uint256 start, uint256 count) external view returns (uint256[] memory out) {
+    /// @notice 分页返回：上架盲盒的 BoxInfo[]（带 tokenId）
+    function getListedByPage(uint256 start, uint256 count)
+        external
+        view
+        returns (BoxInfo[] memory infos)
+    {
         uint256 len = listedTokenIds.length;
-        if (start >= len) return new uint256[](0);
+        if (start >= len) return new BoxInfo[](0);
 
         uint256 end = start + count;
         if (end > len) end = len;
 
-        out = new uint256[](end - start);
-        for (uint256 i = start; i < end; i++) {
-            out[i - start] = listedTokenIds[i];
+        uint256 n = end - start;
+        infos = new BoxInfo[](n);
+
+        for (uint256 i = 0; i < n; i++) {
+            uint256 tokenId = listedTokenIds[start + i];
+            BoxInfo memory bi = boxInfo[tokenId];
+            bi.tokenId = tokenId; // 保险补齐
+            infos[i] = bi;
         }
     }
 
@@ -601,7 +659,6 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
         require(lst.active, "not listed");
         require(lst.seller == msg.sender || hasRole(DEFAULT_ADMIN_ROLE, msg.sender), "not seller/admin");
 
-        // 先从数组移除（mapping 仍保留给底层 _update 判定）
         _removeListedToken(tokenId);
 
         _safeTransfer(address(this), lst.seller, tokenId, "");
@@ -652,7 +709,6 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
         uint256 price = secondaryBuyPrice(tokenId);
         uint256 feeU = _feeUSDT(price);
 
-        // 先从数组移除（listing mapping 保留给 _update 判定成交迁移）
         _removeListedToken(tokenId);
 
         usdt.safeTransferFrom(msg.sender, lst.seller, price);
@@ -662,6 +718,9 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
         }
 
         _safeTransfer(address(this), msg.sender, tokenId, "");
+
+        // 卖家成交记录（append-only）
+        _sellerSoldTokenIds[lst.seller].push(tokenId);
 
         delete listings[tokenId];
 
@@ -699,56 +758,178 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
 
         _safeTransfer(address(this), msg.sender, tokenId, "");
 
+        // 卖家成交记录（append-only）
+        _sellerSoldTokenIds[lst.seller].push(tokenId);
+
         delete listings[tokenId];
 
         emit Purchased(msg.sender, lst.seller, tokenId, price, true, feeU, feeB);
     }
 
     // ============================================================
-    //                 Holding Value (for dividend)
+    //                 Holding Value (simplified + piece addon)
     // ============================================================
 
-    /// @notice 返回某地址当前“盲盒持有价值”（USDT 18位，精确）
-    function holdingValueOf(address user) public view returns (uint256 value) {
-        uint256 baseSum = _sumBase[user];
-        if (baseSum == 0) return 0;
-
-        uint256 brSum = _sumBR[user];
-        uint256 brMinted = _sumBRMinted[user];
-
-        uint256 t = block.timestamp;
-        uint256 tbr = t * brSum;
-        require(tbr >= brMinted, "BAD_SUM");
-        uint256 diff = tbr - brMinted;
-
-        uint256 inc = diff / (DECIMALS_18 * MONTH_SECONDS); // floor
-        value = baseSum + inc;
+    function holdingValueOf(address user) public view returns (uint256) {
+        return _sumUnopenedBase[user] + _pieceHoldingValue[user];
     }
 
-    function holdingAggOf(address user) external view returns (uint256 sumBase, uint256 sumBR, uint256 sumBRMinted) {
-        return (_sumBase[user], _sumBR[user], _sumBRMinted[user]);
+    function holdingBreakdownOf(address user) external view returns (uint256 unopenedSum, uint256 pieceSum, uint256 total) {
+        unopenedSum = _sumUnopenedBase[user];
+        pieceSum = _pieceHoldingValue[user];
+        total = unopenedSum + pieceSum;
     }
 
-    function _holdingAdd(address user, uint256 base, uint256 rate, uint256 mintedAt) internal {
+    function pieceHoldingOf(address user) external view returns (uint256) {
+        return _pieceHoldingValue[user];
+    }
+
+    function _holdingAddBox(address user, uint256 base) internal {
         if (base == 0) return;
-        _sumBase[user] += base;
-
-        uint256 br = base * rate; // 36 decimals
-        _sumBR[user] += br;
-        _sumBRMinted[user] += (br * mintedAt);
+        _sumUnopenedBase[user] += base;
     }
 
-    function _holdingRemove(address user, uint256 base, uint256 rate, uint256 mintedAt) internal {
+    function _holdingRemoveBox(address user, uint256 base) internal {
         if (base == 0) return;
-        _sumBase[user] -= base;
-
-        uint256 br = base * rate;
-        _sumBR[user] -= br;
-        _sumBRMinted[user] -= (br * mintedAt);
+        _sumUnopenedBase[user] -= base;
     }
 
     // ============================================================
-    //              Bottom-layer hook: move economic holding on transfer
+    //                  User lists (dynamic arrays) + pagination
+    //                  (分页只返回 BoxInfo[]，带 tokenId)
+    // ============================================================
+
+    function myUnopenedBoxesLength(address user) external view returns (uint256) {
+        return _myUnopenedBoxes[user].length;
+    }
+
+    function myOpenedBoxesLength(address user) external view returns (uint256) {
+        return _myOpenedBoxes[user].length;
+    }
+
+    function getMyUnopenedBoxesByPage(address user, uint256 start, uint256 count)
+        external
+        view
+        returns (BoxInfo[] memory infos)
+    {
+        uint256 len = _myUnopenedBoxes[user].length;
+        if (start >= len) return new BoxInfo[](0);
+
+        uint256 end = start + count;
+        if (end > len) end = len;
+
+        uint256 n = end - start;
+        infos = new BoxInfo[](n);
+
+        for (uint256 i = 0; i < n; i++) {
+            uint256 tokenId = _myUnopenedBoxes[user][start + i];
+            BoxInfo memory bi = boxInfo[tokenId];
+            bi.tokenId = tokenId;
+            infos[i] = bi;
+        }
+    }
+
+    function getMyOpenedBoxesByPage(address user, uint256 start, uint256 count)
+        external
+        view
+        returns (BoxInfo[] memory infos)
+    {
+        uint256 len = _myOpenedBoxes[user].length;
+        if (start >= len) return new BoxInfo[](0);
+
+        uint256 end = start + count;
+        if (end > len) end = len;
+
+        uint256 n = end - start;
+        infos = new BoxInfo[](n);
+
+        for (uint256 i = 0; i < n; i++) {
+            uint256 tokenId = _myOpenedBoxes[user][start + i];
+            BoxInfo memory bi = boxInfo[tokenId];
+            bi.tokenId = tokenId;
+            infos[i] = bi;
+        }
+    }
+
+    function _myUnopenedAdd(address user, uint256 tokenId) internal {
+        require(_myUnopenedPosPlusOne[user][tokenId] == 0, "ALREADY_IN_MY_UNOPENED");
+        _myUnopenedBoxes[user].push(tokenId);
+        _myUnopenedPosPlusOne[user][tokenId] = _myUnopenedBoxes[user].length; // idx+1
+    }
+
+    function _myUnopenedRemove(address user, uint256 tokenId) internal {
+        uint256 posPlusOne = _myUnopenedPosPlusOne[user][tokenId];
+        require(posPlusOne != 0, "NOT_IN_MY_UNOPENED");
+
+        uint256 idx = posPlusOne - 1;
+        uint256 lastIdx = _myUnopenedBoxes[user].length - 1;
+
+        if (idx != lastIdx) {
+            uint256 lastTokenId = _myUnopenedBoxes[user][lastIdx];
+            _myUnopenedBoxes[user][idx] = lastTokenId;
+            _myUnopenedPosPlusOne[user][lastTokenId] = idx + 1;
+        }
+
+        _myUnopenedBoxes[user].pop();
+        delete _myUnopenedPosPlusOne[user][tokenId];
+    }
+
+    function _myOpenedAdd(address user, uint256 tokenId) internal {
+        require(_myOpenedPosPlusOne[user][tokenId] == 0, "ALREADY_IN_MY_OPENED");
+        _myOpenedBoxes[user].push(tokenId);
+        _myOpenedPosPlusOne[user][tokenId] = _myOpenedBoxes[user].length; // idx+1
+    }
+
+    function _myOpenedRemove(address user, uint256 tokenId) internal {
+        uint256 posPlusOne = _myOpenedPosPlusOne[user][tokenId];
+        require(posPlusOne != 0, "NOT_IN_MY_OPENED");
+
+        uint256 idx = posPlusOne - 1;
+        uint256 lastIdx = _myOpenedBoxes[user].length - 1;
+
+        if (idx != lastIdx) {
+            uint256 lastTokenId = _myOpenedBoxes[user][lastIdx];
+            _myOpenedBoxes[user][idx] = lastTokenId;
+            _myOpenedPosPlusOne[user][lastTokenId] = idx + 1;
+        }
+
+        _myOpenedBoxes[user].pop();
+        delete _myOpenedPosPlusOne[user][tokenId];
+    }
+
+    // ============================================================
+    //                  Seller sold list (pagination: BoxInfo[]，带 tokenId)
+    // ============================================================
+
+    function sellerSoldTokenIdsLength(address seller) external view returns (uint256) {
+        return _sellerSoldTokenIds[seller].length;
+    }
+
+    function getSellerSoldByPage(address seller, uint256 start, uint256 count)
+        external
+        view
+        returns (BoxInfo[] memory infos)
+    {
+        uint256 len = _sellerSoldTokenIds[seller].length;
+        if (start >= len) return new BoxInfo[](0);
+
+        uint256 end = start + count;
+        if (end > len) end = len;
+
+        uint256 n = end - start;
+        infos = new BoxInfo[](n);
+
+        for (uint256 i = 0; i < n; i++) {
+            uint256 tokenId = _sellerSoldTokenIds[seller][start + i];
+            BoxInfo memory bi = boxInfo[tokenId];
+            bi.tokenId = tokenId;
+            infos[i] = bi;
+        }
+    }
+
+    // ============================================================
+    //              Bottom-layer hook: 分清 mint/transfer/burn
+    //              （不需要 economicHolder）
     // ============================================================
 
     function _update(address to, uint256 tokenId, address auth)
@@ -758,134 +939,170 @@ contract BlindBoxNFT is ERC721Enumerable, AccessControl, ReentrancyGuard {
     {
         from = super._update(to, tokenId, auth);
 
-        // burn 不支持，忽略
-        if (to == address(0)) return from;
+        // Burn
+        if (to == address(0)) {
+            if (open[tokenId]) {
+                if (from != address(0)) {
+                    _myOpenedRemove(from, tokenId);
+                }
+            } else {
+                // 未开盒：完整保护（正常情况下你不会让未开盒 burn）
+                address holder = address(0);
 
-        // open 的 token 不应计入持有统计
+                if (from == address(this)) {
+                    Listing memory lst = listings[tokenId];
+                    if (lst.active) holder = lst.seller;
+                } else {
+                    holder = from;
+                }
+
+                if (holder != address(0)) {
+                    _holdingRemoveBox(holder, boxInfo[tokenId].usdtPaid);
+                    _myUnopenedRemove(holder, tokenId);
+                }
+            }
+            return from;
+        }
+
+        // Opened token: 只迁移 opened 列表；holding 不动
         if (open[tokenId]) {
-            economicHolder[tokenId] = address(0);
+            if (from == address(0)) {
+                _myOpenedAdd(to, tokenId);
+                return from;
+            }
+            if (from != to) {
+                _myOpenedRemove(from, tokenId);
+                _myOpenedAdd(to, tokenId);
+            }
             return from;
         }
 
+        // Unopened token
         uint256 base = boxInfo[tokenId].usdtPaid;
-        uint256 rate = tokenMonthlyRateE18[tokenId];
-        uint256 mAt = uint256(boxInfo[tokenId].mintedAt);
 
-        // Mint: 0 -> 用户
+        // Mint
         if (from == address(0)) {
-            economicHolder[tokenId] = to;
-            _holdingAdd(to, base, rate, mAt);
+            _holdingAddBox(to, base);
+            _myUnopenedAdd(to, tokenId);
             return from;
         }
 
-        // Escrow deposit: 用户 -> 本合约（上架），不迁移经济持有
+        // Escrow deposit: user -> this (list)，不动 holding/列表
         if (to == address(this)) {
-            // economicHolder 保持为卖家（from）
-            // 不做 holding 迁移
             return from;
         }
 
-        // Transfer out of escrow: 本合约 -> 某人（下架或成交）
+        // Escrow out: this -> someone
         if (from == address(this)) {
             Listing memory lst = listings[tokenId];
             if (lst.active) {
-                // 下架：回到 seller，不迁移
+                // unlist: back to seller，不迁移
                 if (to == lst.seller) {
                     return from;
                 }
-                // 成交：从 seller 迁移到 buyer(to)
-                _holdingRemove(lst.seller, base, rate, mAt);
-                _holdingAdd(to, base, rate, mAt);
-                economicHolder[tokenId] = to;
+                // sold: seller -> buyer
+                _holdingRemoveBox(lst.seller, base);
+                _myUnopenedRemove(lst.seller, tokenId);
+
+                _holdingAddBox(to, base);
+                _myUnopenedAdd(to, tokenId);
+
                 return from;
             }
-            // 非预期：没有 listing 的 escrow transfer，保守处理：不迁移
             return from;
         }
 
-        // 普通转移（如果未来你放开 transferFrom，这里也能自动保持统计正确）
-        _holdingRemove(from, base, rate, mAt);
-        _holdingAdd(to, base, rate, mAt);
-        economicHolder[tokenId] = to;
+        // Normal transfer
+        _holdingRemoveBox(from, base);
+        _myUnopenedRemove(from, tokenId);
+
+        _holdingAddBox(to, base);
+        _myUnopenedAdd(to, tokenId);
 
         return from;
     }
 
     // ============================================================
-    //                  Pagination reads returning BoxInfo
+    //                  Pagination reads returning BoxInfo (global)
+    //                  （分页只返回 BoxInfo[]，带 tokenId）
     // ============================================================
 
     function mintedTokenIdsLength() external view returns (uint256) {
         return mintedTokenIds.length;
     }
 
-    function openActionTokenIdsLength() external view returns (uint256) {
-        return openActionTokenIds.length;
+    function getMintedByPage(uint256 start, uint256 count)
+        external
+        view
+        returns (BoxInfo[] memory infos)
+    {
+        uint256 len = mintedTokenIds.length;
+        if (start >= len) return new BoxInfo[](0);
+
+        uint256 end = start + count;
+        if (end > len) end = len;
+
+        uint256 n = end - start;
+        infos = new BoxInfo[](n);
+
+        for (uint256 i = 0; i < n; i++) {
+            uint256 tokenId = mintedTokenIds[start + i];
+            BoxInfo memory bi = boxInfo[tokenId];
+            bi.tokenId = tokenId;
+            infos[i] = bi;
+        }
     }
 
     function getOwnerTokensByPage(address owner, uint256 start, uint256 count)
         external
         view
-        returns (uint256[] memory tokenIds, BoxInfo[] memory infos)
+        returns (BoxInfo[] memory infos)
     {
         uint256 bal = balanceOf(owner);
-        if (start >= bal) return (new uint256[](0), new BoxInfo[](0));
+        if (start >= bal) return new BoxInfo[](0);
 
         uint256 end = start + count;
         if (end > bal) end = bal;
 
         uint256 n = end - start;
-        tokenIds = new uint256[](n);
         infos = new BoxInfo[](n);
 
         for (uint256 i = 0; i < n; i++) {
             uint256 tokenId = tokenOfOwnerByIndex(owner, start + i);
-            tokenIds[i] = tokenId;
-            infos[i] = boxInfo[tokenId];
+            BoxInfo memory bi = boxInfo[tokenId];
+            bi.tokenId = tokenId;
+            infos[i] = bi;
         }
     }
 
-    function getMintedByPage(uint256 start, uint256 count)
-        external
-        view
-        returns (uint256[] memory tokenIds, BoxInfo[] memory infos)
-    {
-        uint256 len = mintedTokenIds.length;
-        if (start >= len) return (new uint256[](0), new BoxInfo[](0));
+    // ============================================================
+    //              ✅ Global Open Action Records + Pagination
+    //              OpenActionTokenIdsLength / GetOpenedByPage
+    // ============================================================
 
-        uint256 end = start + count;
-        if (end > len) end = len;
-
-        uint256 n = end - start;
-        tokenIds = new uint256[](n);
-        infos = new BoxInfo[](n);
-
-        for (uint256 i = 0; i < n; i++) {
-            uint256 tokenId = mintedTokenIds[start + i];
-            tokenIds[i] = tokenId;
-            infos[i] = boxInfo[tokenId];
-        }
+    function OpenActionTokenIdsLength() external view returns (uint256) {
+        return openActionTokenIds.length;
     }
 
-    function getOpenedByPage(uint256 start, uint256 count)
+    function GetOpenedByPage(uint256 start, uint256 count)
         external
         view
-        returns (uint256[] memory tokenIds, BoxInfo[] memory infos)
+        returns (BoxInfo[] memory infos)
     {
         uint256 len = openActionTokenIds.length;
-        if (start >= len) return (new uint256[](0), new BoxInfo[](0));
+        if (start >= len) return new BoxInfo[](0);
 
         uint256 end = start + count;
         if (end > len) end = len;
 
         uint256 n = end - start;
-        tokenIds = new uint256[](n);
         infos = new BoxInfo[](n);
 
         for (uint256 i = 0; i < n; i++) {
             uint256 tokenId = openActionTokenIds[start + i];
-            tokenIds[i] = tokenId;
-            infos[i] = boxInfo[tokenId];
+            BoxInfo memory bi = boxInfo[tokenId];
+            bi.tokenId = tokenId; // 保险补齐
+            infos[i] = bi;
         }
     }
 
